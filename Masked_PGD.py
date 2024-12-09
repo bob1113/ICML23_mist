@@ -270,7 +270,18 @@ class LinfPGDAttack(PGDAttack):
     :param targeted: if the attack is targeted.
     """
 
-    def __init__(self, predict, loss_fn=None, eps=0.3, nb_iter=40, eps_iter=0.01, rand_init=True, clip_min=0.0, clip_max=1.0, targeted=False):
+    def __init__(
+        self,
+        predict,
+        loss_fn=None,
+        eps=0.3,
+        nb_iter=40,
+        eps_iter=0.01,
+        rand_init=True,
+        clip_min=0.0,
+        clip_max=1.0,
+        targeted=False,
+    ):
         ord = np.inf
         super(LinfPGDAttack, self).__init__(
             predict=predict,
@@ -293,7 +304,19 @@ class MIFGSM(Attack, LabelMixin):
     Reference: https://arxiv.org/pdf/1710.06081.pdf
     """
 
-    def __init__(self, predict, loss_fn=None, eps=0.3, nb_iter=40, decay_factor=1.0, eps_iter=0.01, clip_min=0.0, clip_max=1.0, targeted=False, ord=np.inf):
+    def __init__(
+        self,
+        predict,
+        loss_fn=None,
+        eps=0.3,
+        nb_iter=40,
+        decay_factor=1.0,
+        eps_iter=0.01,
+        clip_min=0.0,
+        clip_max=1.0,
+        targeted=False,
+        ord=np.inf,
+    ):
         super(MIFGSM, self).__init__(predict, loss_fn, clip_min, clip_max)
         self.eps = eps
         self.nb_iter = nb_iter
@@ -349,7 +372,9 @@ class MIFGSM(Attack, LabelMixin):
             if self.ord == np.inf:
                 # For MIFGSM in L_inf, typically the grad is normalized by its L1 norm
                 # as per the original paper. However, you can also try L2 normalization.
-                grad_norm = torch.mean(torch.abs(grad), dim=[1, 2, 3], keepdim=True) + 1e-10
+                grad_norm = (
+                    torch.mean(torch.abs(grad), dim=[1, 2, 3], keepdim=True) + 1e-10
+                )
                 g = self.decay_factor * g + grad / grad_norm
                 # Update delta: sign of accumulated gradient
                 delta.data = delta.data + self.eps_iter * g.sign()
@@ -360,21 +385,29 @@ class MIFGSM(Attack, LabelMixin):
 
             elif self.ord == 2:
                 # For L2 MIFGSM (less common), normalize by L2
-                grad_norm = torch.sqrt((grad**2).sum(dim=[1, 2, 3], keepdim=True)) + 1e-10
+                grad_norm = (
+                    torch.sqrt((grad**2).sum(dim=[1, 2, 3], keepdim=True)) + 1e-10
+                )
                 g = self.decay_factor * g + grad / grad_norm
                 # Update delta in direction of g
                 norm_g = torch.sqrt((g**2).sum(dim=[1, 2, 3], keepdim=True))
                 scaled_g = g / (norm_g + 1e-10)
                 delta.data = delta.data + self.eps_iter * scaled_g
                 # Project onto L2 ball
-                norm_delta = torch.sqrt((delta.data**2).sum(dim=[1, 2, 3], keepdim=True))
-                factor = torch.min(torch.tensor(1.0, device=x.device), self.eps / norm_delta)
+                norm_delta = torch.sqrt(
+                    (delta.data**2).sum(dim=[1, 2, 3], keepdim=True)
+                )
+                factor = torch.min(
+                    torch.tensor(1.0, device=x.device), self.eps / norm_delta
+                )
                 delta.data = delta.data * factor
                 # Clip to valid range
                 delta.data = clamp(x + delta.data, self.clip_min, self.clip_max) - x
 
             else:
-                raise NotImplementedError("MIFGSM currently only supports ord=inf or ord=2")
+                raise NotImplementedError(
+                    "MIFGSM currently only supports ord=inf or ord=2"
+                )
 
             delta.grad.zero_()
 
@@ -397,7 +430,19 @@ class NIFGSM(Attack, LabelMixin):
     x_nes = x + delta + decay_factor * g, where g is momentum.
     """
 
-    def __init__(self, predict, loss_fn=None, eps=0.3, nb_iter=40, decay_factor=1.0, eps_iter=0.01, clip_min=0.0, clip_max=1.0, targeted=False, ord=np.inf):
+    def __init__(
+        self,
+        predict,
+        loss_fn=None,
+        eps=0.3,
+        nb_iter=40,
+        decay_factor=1.0,
+        eps_iter=0.01,
+        clip_min=0.0,
+        clip_max=1.0,
+        targeted=False,
+        ord=np.inf,
+    ):
         super(NIFGSM, self).__init__(predict, loss_fn, clip_min, clip_max)
         self.eps = eps
         self.nb_iter = nb_iter
@@ -444,7 +489,9 @@ class NIFGSM(Attack, LabelMixin):
             if mask is None:
                 delta.data = clamp(x + delta.data, self.clip_min, self.clip_max) - x
             else:
-                delta.data = clamp(x + delta.data * mask, self.clip_min, self.clip_max) - x
+                delta.data = (
+                    clamp(x + delta.data * mask, self.clip_min, self.clip_max) - x
+                )
 
             delta.grad.zero_()
 
@@ -456,7 +503,7 @@ class NIFGSM(Attack, LabelMixin):
         return x_adv.data
 
 
-def input_diversity(x, prob=0.5, low=224, high=256):
+def _input_diversity(x, prob=0.5, low=224, high=256):
     """
     Example input diversity function:
     With probability `prob`, resize the input to a random size between [low, high]
@@ -471,14 +518,54 @@ def input_diversity(x, prob=0.5, low=224, high=256):
     orig_size = x.shape[-1]
     rnd = np.random.randint(low, high)
     # Resize
-    x_resize = nn.functional.interpolate(x, size=(rnd, rnd), mode='bilinear', align_corners=False)
+    x_resize = nn.functional.interpolate(
+        x, size=(rnd, rnd), mode="bilinear", align_corners=False
+    )
     # Pad
     pad_size = orig_size - rnd
     pad_left = np.random.randint(0, pad_size + 1)
     pad_right = pad_size - pad_left
     pad_top = np.random.randint(0, pad_size + 1)
     pad_bottom = pad_size - pad_top
-    x_pad = nn.functional.pad(x_resize, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+    x_pad = nn.functional.pad(
+        x_resize, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect"
+    )
+    return x_pad
+
+
+def input_diversity(x, prob=0.5, low=224, high=256):
+    if np.random.rand() > prob:
+        return x
+    orig_size = x.shape[-1]
+
+    # Ensure rnd is always <= orig_size
+    rnd = np.random.randint(low, min(high, orig_size + 1))
+    x_resize = nn.functional.interpolate(
+        x, size=(rnd, rnd), mode="bilinear", align_corners=False
+    )
+    pad_size = orig_size - rnd
+
+    # If pad_size is negative or zero, do no reflection pad
+    if pad_size <= 0:
+        # If pad_size is zero, just return x_resize if same size, or skip padding
+        return x_resize if rnd == orig_size else x
+
+    pad_left = np.random.randint(0, pad_size + 1)
+    pad_right = pad_size - pad_left
+    pad_top = np.random.randint(0, pad_size + 1)
+    pad_bottom = pad_size - pad_top
+
+    # Check if reflect pad is feasible:
+    if pad_left < rnd and pad_right < rnd and pad_top < rnd and pad_bottom < rnd:
+        x_pad = nn.functional.pad(
+            x_resize, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect"
+        )
+    else:
+        # If not feasible, use replicate
+        x_pad = nn.functional.pad(
+            x_resize, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate"
+        )
+
     return x_pad
 
 
@@ -495,7 +582,21 @@ class VMIFGSM(Attack, LabelMixin):
     """
 
     def __init__(
-        self, predict, loss_fn=None, eps=0.3, nb_iter=40, decay_factor=1.0, eps_iter=0.01, clip_min=0.0, clip_max=1.0, targeted=False, ord=np.inf, num_samples=5, diversity_prob=0.5, low=224, high=256
+        self,
+        predict,
+        loss_fn=None,
+        eps=0.3,
+        nb_iter=40,
+        decay_factor=1.0,
+        eps_iter=0.01,
+        clip_min=0.0,
+        clip_max=1.0,
+        targeted=False,
+        ord=np.inf,
+        num_samples=5,
+        diversity_prob=0.5,
+        low=224,
+        high=256,
     ):
         """
         :param num_samples: number of diverse samples to average the gradient over.
@@ -531,7 +632,9 @@ class VMIFGSM(Attack, LabelMixin):
                     adv_x = x + delta * mask
 
                 # Apply input diversity
-                adv_x_div = input_diversity(adv_x, prob=self.diversity_prob, low=self.low, high=self.high)
+                adv_x_div = input_diversity(
+                    adv_x, prob=self.diversity_prob, low=self.low, high=self.high
+                )
 
                 outputs = self.predict(adv_x_div)
                 loss = self.loss_fn(outputs, y)
@@ -539,7 +642,9 @@ class VMIFGSM(Attack, LabelMixin):
                     loss = -loss
 
                 delta.grad = None
-                loss.backward(retain_graph=True)  # We retain_graph to accumulate multiple samples
+                loss.backward(
+                    retain_graph=True
+                )  # We retain_graph to accumulate multiple samples
 
                 grads.append(delta.grad.data.clone())
 
@@ -547,7 +652,9 @@ class VMIFGSM(Attack, LabelMixin):
             mean_grad = torch.mean(torch.stack(grads), dim=0)
 
             # Momentum update
-            grad_norm = torch.mean(torch.abs(mean_grad), dim=[1, 2, 3], keepdim=True) + 1e-10
+            grad_norm = (
+                torch.mean(torch.abs(mean_grad), dim=[1, 2, 3], keepdim=True) + 1e-10
+            )
             g = self.decay_factor * g + mean_grad / grad_norm
 
             # Update delta
@@ -560,7 +667,9 @@ class VMIFGSM(Attack, LabelMixin):
             if mask is None:
                 delta.data = clamp(x + delta.data, self.clip_min, self.clip_max) - x
             else:
-                delta.data = clamp(x + delta.data * mask, self.clip_min, self.clip_max) - x
+                delta.data = (
+                    clamp(x + delta.data * mask, self.clip_min, self.clip_max) - x
+                )
 
         if mask is None:
             x_adv = clamp(x + delta, self.clip_min, self.clip_max)
@@ -568,6 +677,7 @@ class VMIFGSM(Attack, LabelMixin):
             x_adv = clamp(x + delta * mask, self.clip_min, self.clip_max)
 
         return x_adv.data
+
 
 class VNIFGSM(Attack, LabelMixin):
     """
@@ -582,9 +692,21 @@ class VNIFGSM(Attack, LabelMixin):
     """
 
     def __init__(
-        self, predict, loss_fn=None, eps=0.3, nb_iter=40, decay_factor=1.0, 
-        eps_iter=0.01, clip_min=0.0, clip_max=1.0, targeted=False, ord=np.inf,
-        num_samples=5, diversity_prob=0.5, low=224, high=256
+        self,
+        predict,
+        loss_fn=None,
+        eps=0.3,
+        nb_iter=40,
+        decay_factor=1.0,
+        eps_iter=0.01,
+        clip_min=0.0,
+        clip_max=1.0,
+        targeted=False,
+        ord=np.inf,
+        num_samples=5,
+        diversity_prob=0.5,
+        low=224,
+        high=256,
     ):
         super(VNIFGSM, self).__init__(predict, loss_fn, clip_min, clip_max)
         self.eps = eps
@@ -617,7 +739,9 @@ class VNIFGSM(Attack, LabelMixin):
             # Compute averaged gradient over multiple transformed samples
             grads = []
             for _ in range(self.num_samples):
-                adv_x_div = input_diversity(x_nes, prob=self.diversity_prob, low=self.low, high=self.high)
+                adv_x_div = input_diversity(
+                    x_nes, prob=self.diversity_prob, low=self.low, high=self.high
+                )
 
                 outputs = self.predict(adv_x_div)
                 loss = self.loss_fn(outputs, y)
@@ -632,7 +756,9 @@ class VNIFGSM(Attack, LabelMixin):
             mean_grad = torch.mean(torch.stack(grads), dim=0)
 
             # Momentum update
-            grad_norm = torch.mean(torch.abs(mean_grad), dim=[1,2,3], keepdim=True) + 1e-10
+            grad_norm = (
+                torch.mean(torch.abs(mean_grad), dim=[1, 2, 3], keepdim=True) + 1e-10
+            )
             g = self.decay_factor * g + mean_grad / grad_norm
 
             # Update delta
@@ -645,7 +771,9 @@ class VNIFGSM(Attack, LabelMixin):
             if mask is None:
                 delta.data = clamp(x + delta.data, self.clip_min, self.clip_max) - x
             else:
-                delta.data = clamp(x + delta.data * mask, self.clip_min, self.clip_max) - x
+                delta.data = (
+                    clamp(x + delta.data * mask, self.clip_min, self.clip_max) - x
+                )
 
         if mask is None:
             x_adv = clamp(x + delta, self.clip_min, self.clip_max)
