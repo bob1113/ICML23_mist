@@ -6,6 +6,8 @@ from PIL import Image
 from einops import rearrange
 import ssl
 from tqdm import tqdm
+from transformers import logging
+
 
 import torch
 import torch.nn as nn
@@ -14,7 +16,7 @@ from pytorch_lightning import seed_everything
 
 from ldm.util import instantiate_from_config
 
-from Masked_PGD import LinfPGDAttack
+from Masked_PGD import LinfPGDAttack, MIFGSM, NIFGSM, VMIFGSM, VNIFGSM
 from mist_utils import parse_args, load_mask, closing_resize, load_image_from_path
 
 
@@ -22,6 +24,10 @@ ssl._create_default_https_context = ssl._create_unverified_context
 os.environ['TORCH_HOME'] = os.getcwd()
 os.environ['HF_HOME'] = os.path.join(os.getcwd(), 'hub/')
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+logging.set_verbosity_error()
+
+adain_attack = False
+inverse_mode = False
 
 
 def load_model_from_config(config, ckpt, verbose: bool = False):
@@ -42,6 +48,7 @@ def load_model_from_config(config, ckpt, verbose: bool = False):
     # Support loading weight from NovelAI
     if "state_dict" in sd:
         import copy
+
         sd_copy = copy.deepcopy(sd)
         for key in sd.keys():
             if key.startswith('cond_stage_model.transformer') and not key.startswith('cond_stage_model.transformer.text_model'):
@@ -68,7 +75,7 @@ def load_model_from_config(config, ckpt, verbose: bool = False):
 class identity_loss(nn.Module):
     """
     An identity loss used for input fn for advertorch. To support semantic loss,
-    the computation of the loss is implemented in class targe_model.
+    the computation of the loss is implemented in class target_model.
     """
 
     def __init__(self):
@@ -83,12 +90,7 @@ class target_model(nn.Module):
     A virtual model which computes the semantic and textural loss in forward function.
     """
 
-    def __init__(self, model,
-                 condition: str,
-                 target_info: str = None,
-                 mode: int = 2,
-                 rate: int = 10000,
-                 input_size = 512):
+    def __init__(self, model, condition: str, adain_attack: bool = True, target_info: str = None, mode: int = 2, rate: int = 10000, input_size=512):
         """
         :param model: A SDM model.
         :param condition: The condition for computing the semantic loss.
@@ -104,6 +106,21 @@ class target_model(nn.Module):
         self.mode = mode
         self.rate = rate
         self.target_size = input_size
+        self.adain_attack = adain_attack  # INFO: Enable
+
+    def adain(self, content_latent, style_latent):
+        """
+        Perform AdaIN-based attack by manipulating statistics of content latent.
+        :param content_latent: Content latent feature.
+        :param style_latent: Style latent feature.
+        :return: Modified latent feature.
+        """
+        content_mean, content_std = content_latent.mean(dim=(2, 3), keepdim=True), content_latent.std(dim=(2, 3), keepdim=True)
+        style_mean, style_std = style_latent.mean(dim=(2, 3), keepdim=True), style_latent.std(dim=(2, 3), keepdim=True)
+
+        normalized = (content_latent - content_mean) / (content_std + 1e-5)
+        attacked_latent = style_std * normalized + style_mean
+        return attacked_latent
 
     def get_components(self, x, no_loss=False):
         """
@@ -136,22 +153,57 @@ class target_model(nn.Module):
 
         zx, loss_semantic = self.get_components(x, True)
         zy, _ = self.get_components(self.target_info, True)
+
+        # INFO: Apply AdaIN if adain_attack is enabled
+        if self.adain_attack:
+            z_attacked = self.adain(zx, zy)
+            loss = self.fn(z_attacked, zy)
+        else:
+            loss = self.fn(zx, zy)
+
+        if self.mode != 1:
+            _, loss_semantic = self.get_components(self.pre_process(x, self.target_size))
+
+        # INFO: inverse mode
+        if inverse_mode:
+            loss = -loss
+            loss_semantic = -loss_semantic
+
+        if components:
+            return loss, loss_semantic
+        if self.mode == 0:  # INFO: semantic loss
+            return -loss_semantic
+        elif self.mode == 1:  # INFO: textural loss
+            return loss
+        else:
+            return loss - loss_semantic * self.rate  # INFO: fused loss
+
+    # INFO: Original forward function
+    def _forward(self, x, components=False):
+        """
+        Compute the loss based on different mode.
+        The textural loss shows the distance between the input image and target image in latent space.
+        The semantic loss describles the semantic content of the image.
+        :return: The loss used for updating gradient in the adversarial attack.
+        """
+
+        zx, loss_semantic = self.get_components(x, True)
+        zy, _ = self.get_components(self.target_info, True)
         if self.mode != 1:
             _, loss_semantic = self.get_components(self.pre_process(x, self.target_size))
         if components:
             return self.fn(zx, zy), loss_semantic
-        if self.mode == 0:
-            return - loss_semantic
-        elif self.mode == 1:
-
+        if self.mode == 0:  # INFO: semantic loss
+            return -loss_semantic
+        elif self.mode == 1:  # INFO: textural loss
             return self.fn(zx, zy)
         else:
             return self.fn(zx, zy) - loss_semantic * self.rate
 
 
-def init(epsilon: int = 16, steps: int = 100, alpha: int = 1,
-         input_size: int = 512, object: bool = False, seed: int = 23,
-         ckpt: str = None, base: str = None, mode: int = 2, rate: int = 10000):
+def init(
+    atk='pgd', epsilon: int = 16, steps: int = 100, alpha: int = 1, input_size: int = 512, object: bool = False, seed: int = 23, ckpt: str = None, base: str = None, mode: int = 2, rate: int = 10000
+):
     """
     Prepare the config and the model used for generating adversarial examples.
     :param epsilon: Strength of adversarial attack in l_{\infinity}.
@@ -174,6 +226,7 @@ def init(epsilon: int = 16, steps: int = 100, alpha: int = 1,
         base = 'configs/stable-diffusion/v1-inference-attack.yaml'
 
     seed_everything(seed)
+    # TODO: remove text prompt
     imagenet_templates_small_style = ['a painting']
     imagenet_templates_small_object = ['a photo']
 
@@ -190,19 +243,12 @@ def init(epsilon: int = 16, steps: int = 100, alpha: int = 1,
     else:
         imagenet_templates_small = imagenet_templates_small_style
 
-    input_prompt = [imagenet_templates_small[0] for i in range(1)]
-    net = target_model(model, input_prompt, mode=mode, rate=rate)
+    input_prompt = [imagenet_templates_small[0] for _ in range(1)]
+    net = target_model(model, input_prompt, adain_attack=True, mode=mode, rate=rate)
     net.eval()
 
     # parameter
-    parameters = {
-        'epsilon': epsilon/255.0 * (1-(-1)),
-        'alpha': alpha/255.0 * (1-(-1)),
-        'steps': steps,
-        'input_size': input_size,
-        'mode': mode,
-        'rate': rate
-    }
+    parameters = {'atk': atk, 'epsilon': epsilon / 255.0 * (1 - (-1)), 'alpha': alpha / 255.0 * (1 - (-1)), 'steps': steps, 'input_size': input_size, 'mode': mode, 'rate': rate}
 
     return {'net': net, 'fn': fn, 'parameters': parameters}
 
@@ -225,6 +271,7 @@ def infer(img: PIL.Image.Image, config, tar_img: PIL.Image.Image = None, mask: P
     steps = parameters["steps"]
     input_size = parameters["input_size"]
     rate = parameters["rate"]
+    atk = parameters["atk"]
     trans = transforms.Compose([transforms.ToTensor()])
 
     img = np.array(img).astype(np.float32) / 127.5 - 1.0
@@ -249,16 +296,26 @@ def infer(img: PIL.Image.Image, config, tar_img: PIL.Image.Image = None, mask: P
     net.mode = mode
     net.rate = rate
     label = torch.zeros(data_source.shape).to(device)
-    print(net(data_source, components=True))
+    # print(net(data_source, components=True))
 
     # Targeted PGD attack is applied.
-    attack = LinfPGDAttack(net, fn, epsilon, steps, eps_iter=alpha, clip_min=-1.0, targeted=True)
+    # INFO: choose different attack methods here
+    if atk == 'mifgsm':
+        attack = MIFGSM(net, fn, epsilon, steps, eps_iter=alpha, clip_min=-1.0, targeted=True)
+    elif atk == 'nifgsm':
+        attack = NIFGSM(net, fn, epsilon, steps, eps_iter=alpha, clip_min=-1.0, targeted=True)
+    elif atk == 'pgd':
+        attack = LinfPGDAttack(net, fn, epsilon, steps, eps_iter=alpha, clip_min=-1.0, targeted=True)
+    elif atk == 'vmifgsm':
+        attack = VMIFGSM(net, fn, epsilon, steps, eps_iter=alpha, clip_min=-1.0, targeted=True)
+    else:
+        raise ValueError("Invalid attack method")
     attack_output = attack.perturb(data_source, label, mask=mask)
-    print(net(attack_output, components=True))
+    # print(net(attack_output, components=True))
 
     output = attack_output[0]
     save_adv = torch.clamp((output + 1.0) / 2.0, min=0.0, max=1.0).detach()
-    grid_adv = 255. * rearrange(save_adv, 'c h w -> h w c').cpu().numpy()
+    grid_adv = 255.0 * rearrange(save_adv, 'c h w -> h w c').cpu().numpy()
     grid_adv = grid_adv
     return grid_adv
 
@@ -268,7 +325,7 @@ def infer(img: PIL.Image.Image, config, tar_img: PIL.Image.Image = None, mask: P
 # Test the new functions:  python mist_v3.py -img test/sample_random_size.png --output_name misted_sample --mask --non_resize --mask_path test/processed_mask.png
 
 # Test the script for Vangogh dataset with command: python mist_v3.py -inp test/vangogh --output_dir vangogh
-# For low Vram cost, test the script with command: python mist_v3.py -inp test/vangogh --output_dir vangogh --block_num 2
+# For low Vram c st, test the script with command: python mist_v3.py -inp test/vangogh --output_dir vangogh --block_num 2
 
 if __name__ == "__main__":
     args = parse_args()
@@ -280,12 +337,13 @@ if __name__ == "__main__":
     rate = 10 ** (args.rate + 3)
     mask = args.mask
     resize = args.non_resize
-    print(epsilon, steps, input_size, block_num, mode, rate, mask, resize)
+    atk = args.atk
+    print(atk, epsilon, steps, input_size, block_num, mode, rate, mask, resize)
     target_image_path = 'MIST.png'
-    bls = input_size//block_num
+    bls = input_size // block_num
     if args.input_dir_path:
         image_dir_path = args.input_dir_path
-        config = init(epsilon=epsilon, steps=steps, mode=mode, rate=rate)
+        config = init(atk, epsilon=epsilon, steps=steps, mode=mode, rate=rate)
         config['parameters']["input_size"] = bls
 
         for img_id in os.listdir(image_dir_path):
@@ -293,10 +351,9 @@ if __name__ == "__main__":
 
             if resize:
                 img, target_size = closing_resize(image_path, input_size, block_num)
-                bls_h = target_size[0]//block_num
-                bls_w = target_size[1]//block_num
-                tar_img = load_image_from_path(target_image_path, target_size[0],
-                                               target_size[1])
+                bls_h = target_size[0] // block_num
+                bls_w = target_size[1] // block_num
+                tar_img = load_image_from_path(target_image_path, target_size[0], target_size[1])
             else:
                 img = load_image_from_path(image_path, input_size)
                 tar_img = load_image_from_path(target_image_path, input_size)
@@ -309,19 +366,22 @@ if __name__ == "__main__":
             for i in tqdm(range(block_num)):
                 for j in tqdm(range(block_num)):
                     if processed_mask is not None:
-                        input_mask = Image.fromarray(np.array(processed_mask)[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h])
+                        input_mask = Image.fromarray(np.array(processed_mask)[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h])
                     else:
                         input_mask = None
-                    img_block = Image.fromarray(np.array(img)[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h])
-                    tar_block = Image.fromarray(np.array(tar_img)[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h])
+                    img_block = Image.fromarray(np.array(img)[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h])
+                    tar_block = Image.fromarray(np.array(tar_img)[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h])
 
-                    output_image[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h] = infer(img_block, config, tar_block, input_mask)
+                    # TODO: generate image
+                    output_image[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h] = infer(img_block, config, tar_block, input_mask)
             output = Image.fromarray(output_image.astype(np.uint8))
-            output_dir = os.path.join('outputs/dirs', args.output_dir)
+            output_dir = args.output_dir
             class_name = '_' + str(epsilon) + '_' + str(steps) + '_' + str(input_size) + '_' + str(block_num) + '_' + str(mode) + '_' + str(args.rate) + '_' + str(int(mask)) + '_' + str(int(resize))
+            class_name += '_adain' if adain_attack else ''
+            class_name += 'inverse' if inverse_mode else ''
             output_path_dir = output_dir + class_name
             if not os.path.exists(output_path_dir):
-                os.mkdir(output_path_dir)
+                os.makedirs(output_path_dir)  # INFO:replace mkdir with makedirs for recursive creation
             output_path = os.path.join(output_path_dir, img_id)
             print("Output image saved in path {}".format(output_path))
             output.save(output_path)
@@ -329,10 +389,9 @@ if __name__ == "__main__":
         image_path = args.input_image_path
         if resize:
             img, target_size = closing_resize(image_path, input_size, block_num)
-            bls_h = target_size[0]//block_num
-            bls_w = target_size[1]//block_num
-            tar_img = load_image_from_path(target_image_path, target_size[0],
-                                           target_size[1])
+            bls_h = target_size[0] // block_num
+            bls_w = target_size[1] // block_num
+            tar_img = load_image_from_path(target_image_path, target_size[0], target_size[1])
         else:
             img = load_image_from_path(image_path, input_size)
             tar_img = load_image_from_path(target_image_path, input_size)
@@ -350,17 +409,19 @@ if __name__ == "__main__":
         for i in tqdm(range(block_num)):
             for j in tqdm(range(block_num)):
                 if processed_mask is not None:
-                    input_mask = Image.fromarray(np.array(processed_mask)[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h])
+                    input_mask = Image.fromarray(np.array(processed_mask)[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h])
                 else:
                     input_mask = None
-                img_block = Image.fromarray(np.array(img)[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h])
-                tar_block = Image.fromarray(np.array(tar_img)[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h])
+                img_block = Image.fromarray(np.array(img)[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h])
+                tar_block = Image.fromarray(np.array(tar_img)[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h])
 
-                output_image[bls_w*i: bls_w*i+bls_w, bls_h*j: bls_h*j + bls_h] = infer(img_block, config, tar_block, input_mask)
+                output_image[bls_w * i : bls_w * i + bls_w, bls_h * j : bls_h * j + bls_h] = infer(img_block, config, tar_block, input_mask)
 
         output = Image.fromarray(output_image.astype(np.uint8))
         output_name = os.path.join('outputs/images', args.output_name)
         save_parameter = '_' + str(epsilon) + '_' + str(steps) + '_' + str(input_size) + '_' + str(block_num) + '_' + str(mode) + '_' + str(args.rate) + '_' + str(int(mask)) + '_' + str(int(resize))
+        save_parameter += '_adain' if adain_attack else ''
+        save_parameter += 'inverse' if inverse_mode else ''
         output_name += save_parameter + '.png'
         print("Output image saved in path {}".format(output_name))
         output.save(output_name)

@@ -37,60 +37,46 @@ def parse_args():
         "--epsilon",
         type=int,
         default=16,
-        help=(
-            "The strength of Mist"
-        ),
+        help=("The strength of Mist"),
     )
     parser.add_argument(
         "-s",
         "--steps",
         type=int,
         default=100,
-        help=(
-            "The step of Mist"
-        ),
+        help=("The step of Mist"),
     )
     parser.add_argument(
         "-in_size",
         "--input_size",
         type=int,
         default=512,
-        help=(
-            "The input_size of Mist"
-        ),
+        help=("The input_size of Mist"),
     )
     parser.add_argument(
         "-b",
         "--block_num",
         type=int,
         default=1,
-        help=(
-            "The number of partitioned blocks"
-        ),
+        help=("The number of partitioned blocks"),
     )
     parser.add_argument(
         "--mode",
         type=int,
         default=2,
-        help=(
-            "The mode of MIST."
-        ),
+        help=("The mode of MIST."),
     )
     parser.add_argument(
         "--rate",
         type=int,
         default=1,
-        help=(
-            "The fused weight under the fused mode."
-        ),
+        help=("The fused weight under the fused mode."),
     )
     parser.add_argument(
         "--mask",
         default=False,
         action="store_true",
-        help=(
-            "Whether to mask certain region of Mist or not. Work only when input_dir_path is None. "
-        ),
+        help=("Whether to mask certain region of Mist or not. Work only when input_dir_path is None. "),
     )
     parser.add_argument(
         "--mask_path",
@@ -102,16 +88,19 @@ def parse_args():
         "--non_resize",
         default=False,
         action="store_true",
-        help=(
-            "Whether to keep the original shape of the image or not."
-        ),
+        help=("Whether to keep the original shape of the image or not."),
+    )
+    parser.add_argument(
+        "--atk",
+        type=str,
+        default="pgd",
     )
     args = parser.parse_args()
     return args
 
 
 def load_mask(mask):
-    mask = np.array(mask)[:,:,0:3]
+    mask = np.array(mask)[:, :, 0:3]
     for p in range(mask.shape[0]):
         for q in range(mask.shape[1]):
             # if np.sum(mask[p][q]) != 0:
@@ -130,8 +119,8 @@ def closing_resize(image_path: str, input_size: int, block_num: int = 1, no_load
         im = Image.open(image_path)
     target_size = list(im.size)
 
-    resize_parameter = min(target_size[0], target_size[1])/input_size
-    block_size = 8 * block_num 
+    resize_parameter = min(target_size[0], target_size[1]) / input_size
+    block_size = 8 * block_num
     target_size[0] = int(target_size[0] / resize_parameter) // block_size * block_size
     target_size[1] = int(target_size[1] / resize_parameter) // block_size * block_size
     img = im.resize(target_size)
@@ -148,10 +137,26 @@ def load_image_from_path(image_path: str, input_width: int, input_height: int = 
     if input_height == 0:
         input_height = input_width
     if no_load:
-        img = image_path.resize((input_width, input_height),
-                                            resample=PIL.Image.BICUBIC)
+        img = image_path.resize((input_width, input_height), resample=PIL.Image.BICUBIC)
     else:
-        img = Image.open(image_path).resize((input_width, input_height),
-                                            resample=PIL.Image.BICUBIC)
+        img = Image.open(image_path).resize((input_width, input_height), resample=PIL.Image.BICUBIC)
     return img
 
+
+def attack_mapping(attack_type: str):
+    if attack_type == "FGSM":
+        from advertorch.attacks import GradientSignAttack
+
+        return GradientSignAttack
+    elif attack_type == "PGD":
+        from advertorch.attacks import LinfPGDAttack
+
+        return LinfPGDAttack
+    elif attack_type == "MIM":
+        from advertorch.attacks import MomentumIterativeAttack
+
+        return MomentumIterativeAttack
+    elif attack_type == "CW":
+        from advertorch.attacks import CarliniWagnerL2Attack
+
+        return CarliniWagnerL2Attack
